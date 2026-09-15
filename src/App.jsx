@@ -670,6 +670,19 @@ export default function FitnessApp() {
     setPortionInput("1");
   };
 
+  // 실제 1인분 스케일 = 실제중량 / 기준량 (실제중량 정보 없으면 1 = 기준량을 그대로 1인분으로 취급)
+  const servingScale = (item) =>
+    item.realServingGrams ? item.realServingGrams / item.basisGrams : 1;
+
+  const scaledFoodNutrients = (item, portion) => {
+    const scale = servingScale(item) * portion;
+    const result = {};
+    for (const [key, val] of Object.entries(item.nutrients || {})) {
+      result[key] = Math.round(val * scale * 100) / 100;
+    }
+    return result;
+  };
+
   const addFoodLog = async () => {
     const portion = parseFloat(portionInput);
     if (!selectedFood || !portion || portion <= 0) {
@@ -677,16 +690,15 @@ export default function FitnessApp() {
       return;
     }
     setFoodSearchError("");
-    const scaledNutrients = {};
-    for (const [key, val] of Object.entries(selectedFood.nutrients || {})) {
-      scaledNutrients[key] = Math.round(val * portion * 100) / 100;
-    }
+    const scaledNutrients = scaledFoodNutrients(selectedFood, portion);
     const item = {
       id: `${todayStr()}-food-${Date.now()}`,
       date: todayStr(),
       meal: mealType,
       name: selectedFood.name,
-      servingSize: selectedFood.servingSize,
+      servingSize: selectedFood.realServingGrams
+        ? `약 ${selectedFood.realServingGrams}g`
+        : `${selectedFood.servingSize} 기준(실제 1인분 정보 없음)`,
       portion,
       nutrients: scaledNutrients,
       source: selectedFood.source,
@@ -924,22 +936,22 @@ export default function FitnessApp() {
 
           {foodResults.length > 0 && !selectedFood && (
             <div style={{ marginTop: 10 }}>
-              {foodResults.map((item, i) => (
-                <button
-                  key={i}
-                  style={styles.foodResultCard}
-                  onClick={() => selectFood(item)}
-                >
-                  <div style={{ flex: 1 }}>
-                    <div style={styles.foodResultName}>{item.name}</div>
-                    <div style={styles.foodResultDesc}>
-                      {item.category} · {item.servingSize} 기준 {item.nutrients.calorie_kcal ?? "?"}
-                      kcal
+              {foodResults.map((item, i) => {
+                const oneServing = scaledFoodNutrients(item, 1);
+                return (
+                  <button key={i} style={styles.foodResultCard} onClick={() => selectFood(item)}>
+                    <div style={{ flex: 1 }}>
+                      <div style={styles.foodResultName}>{item.name}</div>
+                      <div style={styles.foodResultDesc}>
+                        {item.category} ·{" "}
+                        {item.realServingGrams ? `1인분(약 ${item.realServingGrams}g)` : `${item.servingSize} 기준`}{" "}
+                        {oneServing.calorie_kcal ?? "?"}kcal
+                      </div>
                     </div>
-                  </div>
-                  <ChevronRight size={16} color={MUTED} />
-                </button>
-              ))}
+                    <ChevronRight size={16} color={MUTED} />
+                  </button>
+                );
+              })}
             </div>
           )}
 
@@ -952,10 +964,21 @@ export default function FitnessApp() {
                 </button>
               </div>
               <div style={styles.foodResultDesc}>
-                1인분 기준({selectedFood.servingSize}): {selectedFood.nutrients.calorie_kcal ?? "?"}
-                kcal · 단백질 {selectedFood.nutrients.protein_g ?? 0}g · 탄수{" "}
-                {selectedFood.nutrients.carbs_g ?? 0}g · 지방 {selectedFood.nutrients.fat_g ?? 0}g
+                {selectedFood.realServingGrams
+                  ? `1인분(약 ${selectedFood.realServingGrams}g) 기준`
+                  : `${selectedFood.servingSize} 기준`}
+                : {scaledFoodNutrients(selectedFood, 1).calorie_kcal ?? "?"}kcal · 단백질{" "}
+                {scaledFoodNutrients(selectedFood, 1).protein_g ?? 0}g · 탄수{" "}
+                {scaledFoodNutrients(selectedFood, 1).carbs_g ?? 0}g · 지방{" "}
+                {scaledFoodNutrients(selectedFood, 1).fat_g ?? 0}g
               </div>
+              {!selectedFood.realServingGrams && (
+                <div style={styles.bwHint}>
+                  ※ 이 항목은 실제 1인분 중량 정보가 없어 {selectedFood.servingSize} 기준값을 그대로
+                  1인분으로 표시하고 있어요. 실제 섭취량과 다를 수 있으니 인분 수를 눈대중으로
+                  조절해주세요.
+                </div>
+              )}
 
               <div style={styles.cardioTypeRow}>
                 {MEAL_TYPES.map((m) => (
