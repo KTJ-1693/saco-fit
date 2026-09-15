@@ -271,7 +271,7 @@ export default function FitnessApp() {
   const [foodSearching, setFoodSearching] = useState(false);
   const [foodSearchError, setFoodSearchError] = useState("");
   const [selectedFood, setSelectedFood] = useState(null); // 검색결과에서 고른 항목
-  const [portionInput, setPortionInput] = useState("1");
+  const [gramsInput, setGramsInput] = useState("100");
   const [mealType, setMealType] = useState(MEAL_TYPES[0]);
 
   useEffect(() => {
@@ -667,15 +667,12 @@ export default function FitnessApp() {
 
   const selectFood = (item) => {
     setSelectedFood(item);
-    setPortionInput("1");
+    setGramsInput(String(item.realServingGrams || item.basisGrams || 100));
   };
 
-  // 실제 1인분 스케일 = 실제중량 / 기준량 (실제중량 정보 없으면 1 = 기준량을 그대로 1인분으로 취급)
-  const servingScale = (item) =>
-    item.realServingGrams ? item.realServingGrams / item.basisGrams : 1;
-
-  const scaledFoodNutrients = (item, portion) => {
-    const scale = servingScale(item) * portion;
+  // 그람수 기준 스케일 = 입력한 그람 / 기준량(basisGrams, 보통 100g)
+  const scaledFoodNutrientsByGrams = (item, grams) => {
+    const scale = grams / item.basisGrams;
     const result = {};
     for (const [key, val] of Object.entries(item.nutrients || {})) {
       result[key] = Math.round(val * scale * 100) / 100;
@@ -684,22 +681,19 @@ export default function FitnessApp() {
   };
 
   const addFoodLog = async () => {
-    const portion = parseFloat(portionInput);
-    if (!selectedFood || !portion || portion <= 0) {
-      setFoodSearchError("인분 수를 정확히 입력해주세요.");
+    const grams = parseFloat(gramsInput);
+    if (!selectedFood || !grams || grams <= 0) {
+      setFoodSearchError("섭취량(g)을 정확히 입력해주세요.");
       return;
     }
     setFoodSearchError("");
-    const scaledNutrients = scaledFoodNutrients(selectedFood, portion);
+    const scaledNutrients = scaledFoodNutrientsByGrams(selectedFood, grams);
     const item = {
       id: `${todayStr()}-food-${Date.now()}`,
       date: todayStr(),
       meal: mealType,
       name: selectedFood.name,
-      servingSize: selectedFood.realServingGrams
-        ? `약 ${selectedFood.realServingGrams}g`
-        : `${selectedFood.servingSize} 기준(실제 1인분 정보 없음)`,
-      portion,
+      grams,
       nutrients: scaledNutrients,
       source: selectedFood.source,
     };
@@ -899,7 +893,7 @@ export default function FitnessApp() {
                       <div key={f.id} style={styles.foodLogCard}>
                         <div style={{ flex: 1 }}>
                           <div style={styles.foodLogTitle}>
-                            {f.name} <span style={styles.foodLogPortion}>× {f.portion}인분</span>
+                            {f.name} <span style={styles.foodLogPortion}>× {f.grams}g</span>
                           </div>
                           <div style={styles.foodLogDesc}>
                             {f.nutrients.calorie_kcal ?? 0}kcal · 단백질{" "}
@@ -937,15 +931,14 @@ export default function FitnessApp() {
           {foodResults.length > 0 && !selectedFood && (
             <div style={{ marginTop: 10 }}>
               {foodResults.map((item, i) => {
-                const oneServing = scaledFoodNutrients(item, 1);
+                const per100 = scaledFoodNutrientsByGrams(item, item.basisGrams || 100);
                 return (
                   <button key={i} style={styles.foodResultCard} onClick={() => selectFood(item)}>
                     <div style={{ flex: 1 }}>
                       <div style={styles.foodResultName}>{item.name}</div>
                       <div style={styles.foodResultDesc}>
-                        {item.category} ·{" "}
-                        {item.realServingGrams ? `1인분(약 ${item.realServingGrams}g)` : `${item.servingSize} 기준`}{" "}
-                        {oneServing.calorie_kcal ?? "?"}kcal
+                        {item.category} · {item.servingSize}당 {per100.calorie_kcal ?? "?"}kcal
+                        {item.realServingGrams ? ` · 1인분 참고량 약 ${item.realServingGrams}g` : ""}
                       </div>
                     </div>
                     <ChevronRight size={16} color={MUTED} />
@@ -964,19 +957,14 @@ export default function FitnessApp() {
                 </button>
               </div>
               <div style={styles.foodResultDesc}>
-                {selectedFood.realServingGrams
-                  ? `1인분(약 ${selectedFood.realServingGrams}g) 기준`
-                  : `${selectedFood.servingSize} 기준`}
-                : {scaledFoodNutrients(selectedFood, 1).calorie_kcal ?? "?"}kcal · 단백질{" "}
-                {scaledFoodNutrients(selectedFood, 1).protein_g ?? 0}g · 탄수{" "}
-                {scaledFoodNutrients(selectedFood, 1).carbs_g ?? 0}g · 지방{" "}
-                {scaledFoodNutrients(selectedFood, 1).fat_g ?? 0}g
+                {selectedFood.servingSize}당: {selectedFood.nutrients.calorie_kcal ?? "?"}kcal · 단백질{" "}
+                {selectedFood.nutrients.protein_g ?? 0}g · 탄수 {selectedFood.nutrients.carbs_g ?? 0}g ·
+                지방 {selectedFood.nutrients.fat_g ?? 0}g
               </div>
-              {!selectedFood.realServingGrams && (
+              {selectedFood.realServingGrams && (
                 <div style={styles.bwHint}>
-                  ※ 이 항목은 실제 1인분 중량 정보가 없어 {selectedFood.servingSize} 기준값을 그대로
-                  1인분으로 표시하고 있어요. 실제 섭취량과 다를 수 있으니 인분 수를 눈대중으로
-                  조절해주세요.
+                  참고: 이 음식의 1인분 참고 중량은 약 {selectedFood.realServingGrams}g이에요. 아래
+                  칸에 직접 드신 양(g)을 입력하세요.
                 </div>
               )}
 
@@ -997,15 +985,24 @@ export default function FitnessApp() {
                   style={styles.numInput}
                   type="number"
                   inputMode="decimal"
-                  step="0.5"
-                  placeholder="인분"
-                  value={portionInput}
-                  onChange={(e) => setPortionInput(e.target.value)}
+                  step="10"
+                  placeholder="섭취량(g)"
+                  value={gramsInput}
+                  onChange={(e) => setGramsInput(e.target.value)}
                 />
+                <span style={styles.xMark}>g</span>
                 <button style={styles.setAddBtn} onClick={addFoodLog}>
                   기록
                 </button>
               </div>
+              {gramsInput && !isNaN(parseFloat(gramsInput)) && (
+                <div style={styles.foodResultDesc}>
+                  {gramsInput}g 섭취 시:{" "}
+                  {scaledFoodNutrientsByGrams(selectedFood, parseFloat(gramsInput)).calorie_kcal ?? "?"}
+                  kcal · 단백질{" "}
+                  {scaledFoodNutrientsByGrams(selectedFood, parseFloat(gramsInput)).protein_g ?? 0}g
+                </div>
+              )}
             </div>
           )}
         </div>
