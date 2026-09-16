@@ -52,11 +52,13 @@ const SURFACE = "#242120";
 const SURFACE_ALT = "#2E2A28";
 const TEXT = "#F2EDE9";
 const MUTED = "#9C9490";
+const MUTED_LIGHT = "#C9C2BC"; // MUTED보다 밝은 보조 텍스트 (작은 설명글 가독성용)
 const ACCENT = "#C1502E"; // 러스트오렌지 - PUSH / 주요 액션
 const PULL_COLOR = "#7A8C93"; // 스틸 블루그레이 - PULL
 const LEGS_COLOR = "#B8860B"; // 브라스 골드 - LEGS
 const CARDIO_COLOR = "#D9C9B8"; // 웜 크림 - 유산소 표시
 const DANGER = "#D9534F";
+const WARN = "#D9A23B"; // 퇴보 경고(그레이스 기간 지남) 표시용 앰버
 
 const SPLIT_COLORS = { PUSH: ACCENT, PULL: PULL_COLOR, LEGS: LEGS_COLOR };
 const SPLIT_LABELS = { PUSH: "PUSH", PULL: "PULL", LEGS: "LEGS+CORE" }; // 내부 키는 LEGS 유지 (기존 데이터 호환), 표시만 변경
@@ -188,6 +190,154 @@ function estimateStrengthCalories(setsFlat, bodyweightKg) {
   return Math.round(total);
 }
 
+// ── 성장 시스템 (임시 기준치 - 실사용하면서 튜닝 예정) ──────
+// 운동: WHO/ACSM 권장(주2회 이상) = 유지선, 그 이상은 성장, 2주 이상 공백부터 퇴보 시작(디트레이닝 연구 기준)
+// 식단: 목표 칼로리(±15%)+단백질(체중당 1.6~2.2g, ISSN 권고) 둘 다 만족한 날 = "잘 챙긴 날"
+const WORKOUT_GROWTH_MIN_PER_WEEK = 4;
+const WORKOUT_MAINTAIN_MIN_PER_WEEK = 2;
+const DIET_GROWTH_MIN_GOOD_DAYS_PER_WEEK = 5;
+const DIET_MAINTAIN_MIN_GOOD_DAYS_PER_WEEK = 3;
+const DECAY_WARN_DAYS = 14; // 2주 - 디트레이닝 연구상 손실이 감지되기 시작하는 시점
+const DECAY_ACCEL_DAYS = 42; // 6주 - 손실이 가속화되는 시점
+const XP_GROWTH_PER_DAY = 10;
+const XP_DECAY_SLOW_PER_DAY = 3;
+const XP_DECAY_FAST_PER_DAY = 8;
+const XP_PER_LEVEL = 100;
+
+function addDaysStr(dateStr, delta) {
+  const d = new Date(dateStr + "T00:00:00");
+  d.setDate(d.getDate() + delta);
+  return d.toISOString().slice(0, 10);
+}
+
+function daysBetweenStr(a, b) {
+  const da = new Date(a + "T00:00:00");
+  const db = new Date(b + "T00:00:00");
+  return Math.round((db - da) / 86400000);
+}
+
+function dateRangeDays(startStr, endStrInclusive) {
+  const res = [];
+  let cur = startStr;
+  let guard = 0;
+  while (cur <= endStrInclusive && guard < 3660) {
+    res.push(cur);
+    cur = addDaysStr(cur, 1);
+    guard++;
+  }
+  return res;
+}
+
+function zoneToXp(zone) {
+  if (zone === "growth") return XP_GROWTH_PER_DAY;
+  if (zone === "decay-slow") return -XP_DECAY_SLOW_PER_DAY;
+  if (zone === "decay-fast") return -XP_DECAY_FAST_PER_DAY;
+  return 0; // maintain / null
+}
+
+function computeGrowth(entries, cardio, foodLogs, settings) {
+  const workoutDateSet = new Set([...entries.map((e) => e.date), ...cardio.map((c) => c.date)]);
+
+  const dietTotalsByDate = {};
+  for (const f of foodLogs) {
+    if (!dietTotalsByDate[f.date]) dietTotalsByDate[f.date] = { calorie: 0, protein: 0 };
+    dietTotalsByDate[f.date].calorie += f.nutrients?.calorie_kcal || 0;
+    dietTotalsByDate[f.date].protein += f.nutrients?.protein_g || 0;
+  }
+
+  const hasDietGoal = !!(settings.calorieGoal && settings.proteinGoal);
+  const isDietGoodDay = (dateStr) => {
+    if (!hasDietGoal) return false;
+    const t = dietTotalsByDate[dateStr];
+    if (!t) return false;
+    const calOk = Math.abs(t.calorie - settings.calorieGoal) <= settings.calorieGoal * 0.15;
+    const proteinOk = t.protein >= settings.proteinGoal;
+    return calOk && proteinOk;
+  };
+
+  const allDates = [...workoutDateSet, ...Object.keys(dietTotalsByDate)];
+  if (allDates.length === 0) {
+    return {
+      level: 1,
+      xp: 0,
+      xpInLevel: 0,
+      xpForNextLevel: XP_PER_LEVEL,
+      exerciseZone: null,
+      dietZone: null,
+      exerciseDaysThisWeek: 0,
+      dietGoodDaysThisWeek: 0,
+      hasDietGoal,
+      started: false,
+    };
+  }
+
+  const startDate = allDates.reduce((a, b) => (a < b ? a : b));
+  const today = todayStr();
+  const days = dateRangeDays(startDate, today);
+
+  let xp = 0;
+  let lastExerciseDate = null;
+  let lastDietGoodDate = null;
+  let exerciseZoneToday = null;
+  let dietZoneToday = null;
+  let exerciseDaysThisWeek = 0;
+  let dietGoodDaysThisWeek = 0;
+
+  for (const day of days) {
+    const weekDays = dateRangeDays(addDaysStr(day, -6), day);
+    const exCount = weekDays.filter((d2) => workoutDateSet.has(d2)).length;
+    const dietGoodCount = hasDietGoal ? weekDays.filter((d2) => isDietGoodDay(d2)).length : 0;
+
+    if (workoutDateSet.has(day)) lastExerciseDate = day;
+    if (hasDietGoal && isDietGoodDay(day)) lastDietGoodDate = day;
+
+    const daysSinceExercise = lastExerciseDate ? daysBetweenStr(lastExerciseDate, day) : Infinity;
+    const daysSinceDietGood = lastDietGoodDate ? daysBetweenStr(lastDietGoodDate, day) : Infinity;
+
+    let exZone;
+    if (exCount >= WORKOUT_GROWTH_MIN_PER_WEEK) exZone = "growth";
+    else if (exCount >= WORKOUT_MAINTAIN_MIN_PER_WEEK) exZone = "maintain";
+    else if (daysSinceExercise >= DECAY_ACCEL_DAYS) exZone = "decay-fast";
+    else if (daysSinceExercise >= DECAY_WARN_DAYS) exZone = "decay-slow";
+    else exZone = "maintain";
+
+    let dietZone = null;
+    if (hasDietGoal) {
+      if (dietGoodCount >= DIET_GROWTH_MIN_GOOD_DAYS_PER_WEEK) dietZone = "growth";
+      else if (dietGoodCount >= DIET_MAINTAIN_MIN_GOOD_DAYS_PER_WEEK) dietZone = "maintain";
+      else if (daysSinceDietGood >= DECAY_ACCEL_DAYS) dietZone = "decay-fast";
+      else if (daysSinceDietGood >= DECAY_WARN_DAYS) dietZone = "decay-slow";
+      else dietZone = "maintain";
+    }
+
+    xp += hasDietGoal ? zoneToXp(exZone) * 0.5 + zoneToXp(dietZone) * 0.5 : zoneToXp(exZone);
+
+    if (day === today) {
+      exerciseZoneToday = exZone;
+      dietZoneToday = dietZone;
+      exerciseDaysThisWeek = exCount;
+      dietGoodDaysThisWeek = dietGoodCount;
+    }
+  }
+
+  const clampedXp = Math.max(0, Math.round(xp));
+  const level = Math.floor(clampedXp / XP_PER_LEVEL) + 1;
+  const xpInLevel = clampedXp % XP_PER_LEVEL;
+
+  return {
+    level,
+    xp: clampedXp,
+    xpInLevel,
+    xpForNextLevel: XP_PER_LEVEL,
+    exerciseZone: exerciseZoneToday,
+    dietZone: dietZoneToday,
+    exerciseDaysThisWeek,
+    dietGoodDaysThisWeek,
+    hasDietGoal,
+    started: true,
+  };
+}
+
 function suggestNext(pastSets) {
   if (!pastSets || pastSets.length === 0) return null;
   const withKg = pastSets.map((s) => ({ ...s, kg: toKg(s.weight, s.unit || "kg") }));
@@ -238,6 +388,12 @@ export default function FitnessApp() {
   const [selectedDate, setSelectedDate] = useState(null);
   const [logDate, setLogDate] = useState(() => todayStr()); // 'log' 화면이 기록하는 대상 날짜 (오늘 or 보강할 과거 날짜)
 
+  // 식단 관리 내비게이션
+  const [nutritionView, setNutritionView] = useState("log"); // 'log' | 'calendar' | 'detail'
+  const [foodLogDate, setFoodLogDate] = useState(() => todayStr());
+  const [foodCalendarMonth, setFoodCalendarMonth] = useState(() => new Date());
+  const [selectedFoodDate, setSelectedFoodDate] = useState(null);
+
   // 로그 입력 상태
   const [split, setSplit] = useState("PUSH");
   const [exerciseInput, setExerciseInput] = useState("");
@@ -247,6 +403,8 @@ export default function FitnessApp() {
   const [error, setError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [bodyweightInput, setBodyweightInput] = useState("");
+  const [calorieGoalInput, setCalorieGoalInput] = useState("");
+  const [proteinGoalInput, setProteinGoalInput] = useState("");
   const [isBodyweight, setIsBodyweight] = useState(false);
   const [bwPercent, setBwPercent] = useState(100);
   const [unit, setUnit] = useState("kg");
@@ -273,6 +431,14 @@ export default function FitnessApp() {
   const [selectedFood, setSelectedFood] = useState(null); // 검색결과에서 고른 항목
   const [gramsInput, setGramsInput] = useState("100");
   const [mealType, setMealType] = useState(MEAL_TYPES[0]);
+  const [manualMode, setManualMode] = useState(false);
+  const [manualName, setManualName] = useState("");
+  const [manualGrams, setManualGrams] = useState("");
+  const [manualCalories, setManualCalories] = useState("");
+  const [manualProtein, setManualProtein] = useState("");
+  const [manualCarbs, setManualCarbs] = useState("");
+  const [manualFat, setManualFat] = useState("");
+  const [manualSodium, setManualSodium] = useState("");
 
   useEffect(() => {
     (async () => {
@@ -338,6 +504,25 @@ export default function FitnessApp() {
     setSettings(next);
     await persistSettings(next);
     setSettingsOpen(false);
+  };
+
+  const saveGoals = async () => {
+    const cal = parseFloat(calorieGoalInput);
+    const protein = parseFloat(proteinGoalInput);
+    if ((!cal || cal <= 0) && (!protein || protein <= 0)) {
+      setError("목표 칼로리 또는 단백질 중 하나는 정확히 입력해주세요.");
+      return;
+    }
+    setError("");
+    const next = {
+      ...settings,
+      calorieGoal: cal > 0 ? cal : settings.calorieGoal,
+      proteinGoal: protein > 0 ? protein : settings.proteinGoal,
+    };
+    setSettings(next);
+    await persistSettings(next);
+    setCalorieGoalInput("");
+    setProteinGoalInput("");
   };
 
   const isToday = logDate === todayStr();
@@ -689,8 +874,8 @@ export default function FitnessApp() {
     setFoodSearchError("");
     const scaledNutrients = scaledFoodNutrientsByGrams(selectedFood, grams);
     const item = {
-      id: `${todayStr()}-food-${Date.now()}`,
-      date: todayStr(),
+      id: `${foodLogDate}-food-${Date.now()}`,
+      date: foodLogDate,
       meal: mealType,
       name: selectedFood.name,
       grams,
@@ -705,15 +890,61 @@ export default function FitnessApp() {
     await persistFoodLogs(nextLogs);
   };
 
+  const resetManualForm = () => {
+    setManualMode(false);
+    setManualName("");
+    setManualGrams("");
+    setManualCalories("");
+    setManualProtein("");
+    setManualCarbs("");
+    setManualFat("");
+    setManualSodium("");
+  };
+
+  const addManualFoodLog = async () => {
+    const name = manualName.trim();
+    const cal = parseFloat(manualCalories);
+    if (!name || isNaN(cal) || cal < 0) {
+      setFoodSearchError("음식 이름과 칼로리는 필수로 입력해주세요.");
+      return;
+    }
+    setFoodSearchError("");
+    const num = (v) => {
+      const n = parseFloat(v);
+      return isNaN(n) ? 0 : n;
+    };
+    const item = {
+      id: `${foodLogDate}-food-${Date.now()}`,
+      date: foodLogDate,
+      meal: mealType,
+      name,
+      grams: manualGrams.trim() ? manualGrams.trim() : null,
+      nutrients: {
+        calorie_kcal: cal,
+        protein_g: num(manualProtein),
+        carbs_g: num(manualCarbs),
+        fat_g: num(manualFat),
+        sodium_mg: num(manualSodium),
+      },
+      source: "직접 입력",
+    };
+    const nextLogs = [...foodLogs, item];
+    setFoodLogs(nextLogs);
+    resetManualForm();
+    await persistFoodLogs(nextLogs);
+  };
+
   const deleteFoodLog = async (id) => {
     const nextLogs = foodLogs.filter((f) => f.id !== id);
     setFoodLogs(nextLogs);
     await persistFoodLogs(nextLogs);
   };
 
+  const isFoodToday = foodLogDate === todayStr();
+
   const todayFoodLogs = useMemo(
-    () => foodLogs.filter((f) => f.date === todayStr()),
-    [foodLogs]
+    () => foodLogs.filter((f) => f.date === foodLogDate),
+    [foodLogs, foodLogDate]
   );
 
   const todayFoodTotals = useMemo(() => {
@@ -726,6 +957,29 @@ export default function FitnessApp() {
     for (const key of Object.keys(totals)) totals[key] = Math.round(totals[key] * 10) / 10;
     return totals;
   }, [todayFoodLogs]);
+
+  // 캘린더용: 음식 기록 있는 날짜 집합
+  const foodLogDatesSet = useMemo(() => {
+    const set = new Set();
+    for (const f of foodLogs) set.add(f.date);
+    return set;
+  }, [foodLogs]);
+
+  const selectedFoodDateLogs = useMemo(
+    () => (selectedFoodDate ? foodLogs.filter((f) => f.date === selectedFoodDate) : []),
+    [foodLogs, selectedFoodDate]
+  );
+
+  const selectedFoodDateTotals = useMemo(() => {
+    const totals = { calorie_kcal: 0, protein_g: 0, carbs_g: 0, fat_g: 0, sodium_mg: 0 };
+    for (const log of selectedFoodDateLogs) {
+      for (const key of Object.keys(totals)) {
+        if (log.nutrients && log.nutrients[key] != null) totals[key] += log.nutrients[key];
+      }
+    }
+    for (const key of Object.keys(totals)) totals[key] = Math.round(totals[key] * 10) / 10;
+    return totals;
+  }, [selectedFoodDateLogs]);
 
   const estimatedCalories = useMemo(
     () =>
@@ -793,6 +1047,11 @@ export default function FitnessApp() {
     [cardio, selectedDate]
   );
 
+  const growth = useMemo(
+    () => computeGrowth(entries, cardio, foodLogs, settings),
+    [entries, cardio, foodLogs, settings]
+  );
+
   if (!ready) {
     return (
       <div style={styles.loadingScreen}>
@@ -803,13 +1062,66 @@ export default function FitnessApp() {
 
   // ── 홈 화면 ─────────────────────────────────────────
   if (screen === "home") {
+    const zoneLabel = { growth: "성장 중", maintain: "유지 중", "decay-slow": "퇴보 경고", "decay-fast": "퇴보 중" };
+    const zoneColor = {
+      growth: ACCENT,
+      maintain: MUTED_LIGHT,
+      "decay-slow": WARN,
+      "decay-fast": DANGER,
+    };
+    const dumbbellColor = growth.level >= 5 ? ACCENT : growth.level >= 3 ? PULL_COLOR : MUTED;
+    const dumbbellSize = Math.min(56, 26 + growth.level * 4);
+
     return (
       <div style={styles.app}>
         <div style={styles.homeHeader}>
           <div style={styles.homeTitle}>싸코 FIT</div>
           <div style={styles.homeSubtitle}>오늘도 무게를 짊어질 시간</div>
         </div>
+
         <div style={styles.homeBody}>
+          <div style={styles.growthCard}>
+            <div style={styles.growthTop}>
+              <div
+                style={{
+                  ...styles.growthDumbbellWrap,
+                  boxShadow: growth.level >= 5 ? `0 0 16px ${ACCENT}55` : "none",
+                }}
+              >
+                <Dumbbell size={dumbbellSize} color={dumbbellColor} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <div style={styles.growthLevelText}>Lv.{growth.level}</div>
+                {growth.started ? (
+                  <div style={styles.growthXpBarTrack}>
+                    <div
+                      style={{
+                        ...styles.growthXpBarFill,
+                        width: `${(growth.xpInLevel / growth.xpForNextLevel) * 100}%`,
+                      }}
+                    />
+                  </div>
+                ) : (
+                  <div style={styles.navCardDesc}>기록을 시작하면 성장이 시작돼요</div>
+                )}
+              </div>
+            </div>
+            {growth.started && (
+              <div style={styles.growthStatusRow}>
+                <span style={{ color: zoneColor[growth.exerciseZone] || MUTED_LIGHT }}>
+                  운동 이번주 {growth.exerciseDaysThisWeek}일 · {zoneLabel[growth.exerciseZone] || "-"}
+                </span>
+                {growth.hasDietGoal ? (
+                  <span style={{ color: zoneColor[growth.dietZone] || MUTED_LIGHT }}>
+                    식단 목표달성 {growth.dietGoodDaysThisWeek}일 · {zoneLabel[growth.dietZone] || "-"}
+                  </span>
+                ) : (
+                  <span style={{ color: MUTED }}>식단 목표 미설정 (운동기록 ⚙에서 설정)</span>
+                )}
+              </div>
+            )}
+          </div>
+
           <button
             style={styles.navCard}
             onClick={() => {
@@ -829,7 +1141,16 @@ export default function FitnessApp() {
             <ChevronRight size={20} color={MUTED} />
           </button>
 
-          <button style={styles.navCard} onClick={() => setScreen("nutrition")}>
+          <button
+            style={styles.navCard}
+            onClick={() => {
+              setScreen("nutrition");
+              setNutritionView("log");
+              setFoodLogDate(todayStr());
+              setSelectedFood(null);
+              setManualMode(false);
+            }}
+          >
             <div style={{ ...styles.navCardIcon, background: "rgba(122,140,147,0.16)" }}>
               <Utensils size={26} color={PULL_COLOR} />
             </div>
@@ -845,19 +1166,189 @@ export default function FitnessApp() {
   }
 
   // ── 식단 관리 (스텁) ─────────────────────────────────
-  if (screen === "nutrition") {
+  // ── 식단 관리: 캘린더 히스토리 ──────────────────────────
+  if (screen === "nutrition" && nutritionView === "calendar") {
+    const y = foodCalendarMonth.getFullYear();
+    const m = foodCalendarMonth.getMonth();
+    const firstDow = new Date(y, m, 1).getDay();
+    const daysInMonth = new Date(y, m + 1, 0).getDate();
+    const cells = [];
+    for (let i = 0; i < firstDow; i++) cells.push(null);
+    for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+
     return (
       <div style={styles.app}>
         <div style={styles.subHeader}>
-          <button style={styles.backBtn} onClick={() => setScreen("home")}>
-            <Home size={18} color={MUTED} />
+          <button style={styles.backBtn} onClick={() => setNutritionView("log")}>
+            <X size={18} color={MUTED} />
           </button>
-          <span style={styles.subHeaderTitle}>식단 관리</span>
+          <span style={styles.subHeaderTitle}>식단 히스토리</span>
+        </div>
+
+        <div style={styles.body}>
+          <div style={styles.monthNavRow}>
+            <button style={styles.monthNavBtn} onClick={() => setFoodCalendarMonth(new Date(y, m - 1, 1))}>
+              <ChevronLeft size={18} color={MUTED} />
+            </button>
+            <span style={styles.monthLabel}>
+              {y}. {String(m + 1).padStart(2, "0")}
+            </span>
+            <button style={styles.monthNavBtn} onClick={() => setFoodCalendarMonth(new Date(y, m + 1, 1))}>
+              <ChevronRight size={18} color={MUTED} />
+            </button>
+          </div>
+
+          <div style={styles.weekdayRow}>
+            {["일", "월", "화", "수", "목", "금", "토"].map((w) => (
+              <div key={w} style={styles.weekdayCell}>
+                {w}
+              </div>
+            ))}
+          </div>
+
+          <div style={styles.calendarGrid}>
+            {cells.map((d, i) => {
+              if (d === null) return <div key={i} style={styles.calendarCellEmpty} />;
+              const key = dateKey(y, m, d);
+              const hasData = foodLogDatesSet.has(key);
+              const isTodayCell = key === todayStr();
+              const isPastOrToday = key <= todayStr();
+              const clickable = hasData || isPastOrToday;
+              return (
+                <button
+                  key={i}
+                  style={{
+                    ...styles.calendarCell,
+                    ...(isTodayCell ? styles.calendarCellToday : {}),
+                    ...(hasData ? {} : isPastOrToday ? styles.calendarCellBackfillable : styles.calendarCellDisabled),
+                  }}
+                  onClick={() => {
+                    if (!clickable) return;
+                    if (hasData) {
+                      setSelectedFoodDate(key);
+                      setNutritionView("detail");
+                    } else {
+                      setFoodLogDate(key);
+                      setSelectedFood(null);
+                      setManualMode(false);
+                      setNutritionView("log");
+                    }
+                  }}
+                >
+                  <span style={styles.calendarDateNum}>{d}</span>
+                  <div style={styles.calendarDots}>
+                    {hasData && <span style={{ ...styles.calendarDot, background: PULL_COLOR }} />}
+                    {!hasData && isPastOrToday && <Plus size={7} color={MUTED} />}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── 식단 관리: 특정 날짜 상세 (읽기 전용) ────────────────
+  if (screen === "nutrition" && nutritionView === "detail") {
+    return (
+      <div style={styles.app}>
+        <div style={styles.subHeader}>
+          <button
+            style={styles.backBtn}
+            onClick={() => {
+              setNutritionView("calendar");
+              setSelectedFoodDate(null);
+            }}
+          >
+            <ChevronLeft size={18} color={MUTED} />
+          </button>
+          <span style={styles.subHeaderTitle}>{selectedFoodDate}</span>
+        </div>
+        <div style={styles.body}>
+          <div style={styles.dayDetailVolume}>
+            총 {selectedFoodDateTotals.calorie_kcal.toLocaleString()}kcal · 단백질{" "}
+            {selectedFoodDateTotals.protein_g}g · 탄수 {selectedFoodDateTotals.carbs_g}g · 지방{" "}
+            {selectedFoodDateTotals.fat_g}g
+          </div>
+          {MEAL_TYPES.map((meal) => {
+            const logs = selectedFoodDateLogs.filter((f) => f.meal === meal);
+            if (logs.length === 0) return null;
+            return (
+              <div key={meal} style={{ marginBottom: 4 }}>
+                <div style={styles.mealLabel}>{meal}</div>
+                {logs.map((f) => (
+                  <div key={f.id} style={styles.foodLogCard}>
+                    <div style={{ flex: 1 }}>
+                      <div style={styles.foodLogTitle}>
+                        {f.name}{" "}
+                        {f.grams != null && f.grams !== "" && (
+                          <span style={styles.foodLogPortion}>
+                            × {typeof f.grams === "number" ? `${f.grams}g` : f.grams}
+                          </span>
+                        )}
+                      </div>
+                      <div style={styles.foodLogDesc}>
+                        {f.nutrients.calorie_kcal ?? 0}kcal · 단백질 {f.nutrients.protein_g ?? 0}g · 탄수{" "}
+                        {f.nutrients.carbs_g ?? 0}g · 지방 {f.nutrients.fat_g ?? 0}g
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+          <button
+            style={styles.addToDateBtn}
+            onClick={() => {
+              setFoodLogDate(selectedFoodDate);
+              setSelectedFood(null);
+              setManualMode(false);
+              setNutritionView("log");
+            }}
+          >
+            <Plus size={14} color={ACCENT} />
+            이 날짜에 기록 추가
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (screen === "nutrition" && nutritionView === "log") {
+    return (
+      <div style={styles.app}>
+        <div style={styles.subHeader}>
+          <button
+            style={styles.backBtn}
+            onClick={() => {
+              if (isFoodToday) {
+                setScreen("home");
+              } else {
+                setNutritionView("calendar");
+              }
+            }}
+          >
+            {isFoodToday ? <Home size={18} color={MUTED} /> : <ChevronLeft size={18} color={MUTED} />}
+          </button>
+          <span style={styles.subHeaderTitle}>{isFoodToday ? "식단 관리" : foodLogDate}</span>
+          {!isFoodToday && <span style={styles.backfillBadge}>기록 보강</span>}
+          <div style={{ flex: 1 }} />
+          <button
+            style={styles.viewToggle}
+            onClick={() => {
+              setNutritionView("calendar");
+              setSelectedFood(null);
+              setManualMode(false);
+            }}
+          >
+            <CalendarIcon size={18} color={MUTED} />
+          </button>
         </div>
 
         <div style={styles.body}>
           <div style={styles.sectionLabelRow}>
-            <span style={styles.sectionLabel}>오늘 섭취</span>
+            <span style={styles.sectionLabel}>{isFoodToday ? "오늘 섭취" : "이 날짜 섭취"}</span>
             <span style={styles.todayVolumeText}>
               {todayFoodTotals.calorie_kcal.toLocaleString()}kcal
             </span>
@@ -893,7 +1384,12 @@ export default function FitnessApp() {
                       <div key={f.id} style={styles.foodLogCard}>
                         <div style={{ flex: 1 }}>
                           <div style={styles.foodLogTitle}>
-                            {f.name} <span style={styles.foodLogPortion}>× {f.grams}g</span>
+                            {f.name}{" "}
+                            {f.grams != null && f.grams !== "" && (
+                              <span style={styles.foodLogPortion}>
+                                × {typeof f.grams === "number" ? `${f.grams}g` : f.grams}
+                              </span>
+                            )}
                           </div>
                           <div style={styles.foodLogDesc}>
                             {f.nutrients.calorie_kcal ?? 0}kcal · 단백질{" "}
@@ -927,6 +1423,107 @@ export default function FitnessApp() {
           </div>
           {foodSearching && <div style={styles.bwHint}>검색 중…</div>}
           {foodSearchError && <div style={styles.errorText}>{foodSearchError}</div>}
+
+          {!manualMode && !selectedFood && (
+            <button
+              style={styles.manualAddToggleBtn}
+              onClick={() => {
+                setManualMode(true);
+                setFoodResults([]);
+                setFoodSearchError("");
+              }}
+            >
+              <Plus size={13} color={PULL_COLOR} />
+              검색에 없는 음식 직접 추가
+            </button>
+          )}
+
+          {manualMode && (
+            <div style={styles.selectedFoodCard}>
+              <div style={styles.selectedFoodHeader}>
+                <div style={styles.foodResultName}>직접 추가</div>
+                <button style={styles.backBtn} onClick={resetManualForm}>
+                  <X size={16} color={MUTED} />
+                </button>
+              </div>
+
+              <input
+                style={{ ...styles.input, marginBottom: 8 }}
+                placeholder="음식 이름"
+                value={manualName}
+                onChange={(e) => setManualName(e.target.value)}
+              />
+              <input
+                style={{ ...styles.input, marginBottom: 8 }}
+                placeholder="섭취량 표기(선택, 예: 200g, 1개, 1인분)"
+                value={manualGrams}
+                onChange={(e) => setManualGrams(e.target.value)}
+              />
+
+              <div style={styles.cardioInputRow}>
+                <input
+                  style={styles.numInput}
+                  type="number"
+                  inputMode="decimal"
+                  placeholder="칼로리(kcal) *필수"
+                  value={manualCalories}
+                  onChange={(e) => setManualCalories(e.target.value)}
+                />
+                <input
+                  style={styles.numInput}
+                  type="number"
+                  inputMode="decimal"
+                  placeholder="단백질(g)"
+                  value={manualProtein}
+                  onChange={(e) => setManualProtein(e.target.value)}
+                />
+              </div>
+              <div style={styles.cardioInputRow}>
+                <input
+                  style={styles.numInput}
+                  type="number"
+                  inputMode="decimal"
+                  placeholder="탄수화물(g)"
+                  value={manualCarbs}
+                  onChange={(e) => setManualCarbs(e.target.value)}
+                />
+                <input
+                  style={styles.numInput}
+                  type="number"
+                  inputMode="decimal"
+                  placeholder="지방(g)"
+                  value={manualFat}
+                  onChange={(e) => setManualFat(e.target.value)}
+                />
+              </div>
+              <div style={styles.cardioInputRow}>
+                <input
+                  style={styles.numInput}
+                  type="number"
+                  inputMode="decimal"
+                  placeholder="나트륨(mg, 선택)"
+                  value={manualSodium}
+                  onChange={(e) => setManualSodium(e.target.value)}
+                />
+              </div>
+
+              <div style={styles.cardioTypeRow}>
+                {MEAL_TYPES.map((m) => (
+                  <button
+                    key={m}
+                    style={{ ...styles.cardioTypeChip, ...(mealType === m ? styles.cardioTypeChipActive : {}) }}
+                    onClick={() => setMealType(m)}
+                  >
+                    {m}
+                  </button>
+                ))}
+              </div>
+
+              <button style={{ ...styles.setAddBtn, width: "100%" }} onClick={addManualFoodLog}>
+                기록
+              </button>
+            </div>
+          )}
 
           {foodResults.length > 0 && !selectedFood && (
             <div style={{ marginTop: 10 }}>
@@ -1245,6 +1842,38 @@ export default function FitnessApp() {
                 <Check size={20} color={BG} />
               </button>
             </div>
+
+            <div style={{ ...styles.settingsLabel, marginTop: 14 }}>
+              성장 목표 (식단이 성장 판정에 반영되려면 둘 다 필요)
+            </div>
+            <div style={styles.cardioInputRow}>
+              <input
+                style={styles.numInput}
+                type="number"
+                inputMode="decimal"
+                placeholder={settings.calorieGoal ? `목표 ${settings.calorieGoal}kcal` : "목표 칼로리"}
+                value={calorieGoalInput}
+                onChange={(e) => setCalorieGoalInput(e.target.value)}
+              />
+              <input
+                style={styles.numInput}
+                type="number"
+                inputMode="decimal"
+                placeholder={settings.proteinGoal ? `목표 ${settings.proteinGoal}g` : "목표 단백질(g)"}
+                value={proteinGoalInput}
+                onChange={(e) => setProteinGoalInput(e.target.value)}
+              />
+              <button style={styles.addBtn} onClick={saveGoals}>
+                <Check size={20} color={BG} />
+              </button>
+            </div>
+            {settings.bodyweight && !settings.proteinGoal && (
+              <div style={styles.bwHint}>
+                참고: 체중 {settings.bodyweight}kg 기준 단백질은 보통 1.6~2.2g/kg (
+                {Math.round(settings.bodyweight * 1.6)}~{Math.round(settings.bodyweight * 2.2)}g) 범위를
+                많이 씁니다.
+              </div>
+            )}
           </div>
         )}
         <div style={styles.tabRow}>
@@ -1752,6 +2381,53 @@ const styles = {
   },
   homeSubtitle: { fontSize: 13, color: MUTED, marginTop: 4 },
   homeBody: { padding: "4px 16px" },
+  growthCard: {
+    background: SURFACE,
+    border: `1px solid ${SURFACE_ALT}`,
+    borderRadius: 14,
+    padding: 16,
+    marginBottom: 16,
+  },
+  growthTop: { display: "flex", alignItems: "center", gap: 14 },
+  growthDumbbellWrap: {
+    width: 60,
+    height: 60,
+    borderRadius: 14,
+    background: SURFACE_ALT,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+  },
+  growthLevelText: {
+    fontSize: 15,
+    fontWeight: 900,
+    textTransform: "uppercase",
+    marginBottom: 6,
+    fontVariantNumeric: "tabular-nums",
+  },
+  growthXpBarTrack: {
+    width: "100%",
+    height: 8,
+    background: SURFACE_ALT,
+    borderRadius: 4,
+    overflow: "hidden",
+  },
+  growthXpBarFill: {
+    height: "100%",
+    background: ACCENT,
+    borderRadius: 4,
+  },
+  growthStatusRow: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+    marginTop: 12,
+    paddingTop: 12,
+    borderTop: `1px solid ${SURFACE_ALT}`,
+    fontSize: 11,
+    fontWeight: 600,
+  },
   navCard: {
     width: "100%",
     display: "flex",
@@ -1855,7 +2531,7 @@ const styles = {
   },
   foodLogTitle: { fontSize: 14, fontWeight: 700 },
   foodLogPortion: { fontSize: 12, color: MUTED, fontWeight: 500 },
-  foodLogDesc: { fontSize: 11, color: MUTED, marginTop: 3, fontVariantNumeric: "tabular-nums" },
+  foodLogDesc: { fontSize: 12, color: MUTED_LIGHT, marginTop: 3, fontVariantNumeric: "tabular-nums" },
   foodDeleteBtn: {
     width: 28,
     height: 28,
@@ -1882,7 +2558,7 @@ const styles = {
     textAlign: "left",
   },
   foodResultName: { fontSize: 14, fontWeight: 700 },
-  foodResultDesc: { fontSize: 11, color: MUTED, marginTop: 3, fontVariantNumeric: "tabular-nums" },
+  foodResultDesc: { fontSize: 12, color: MUTED_LIGHT, marginTop: 3, fontVariantNumeric: "tabular-nums" },
   selectedFoodCard: {
     background: SURFACE,
     border: `1px solid ${PULL_COLOR}`,
@@ -1891,6 +2567,22 @@ const styles = {
     marginTop: 10,
   },
   selectedFoodHeader: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 },
+  manualAddToggleBtn: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    width: "100%",
+    marginTop: 10,
+    background: "none",
+    border: `1px dashed ${SURFACE_ALT}`,
+    borderRadius: 10,
+    padding: "10px",
+    color: PULL_COLOR,
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
 
   header: {
     position: "sticky",
